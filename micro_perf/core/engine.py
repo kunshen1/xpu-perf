@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import queue
 import pathlib
 import traceback
 import threading
@@ -130,7 +131,23 @@ class BaseEngine(ABC):
 
             all_results = {}
             for _ in range(task_idx):
-                result_idx, result_dict = self.output_queue.get()
+                result = None
+                while result is None:
+                    try:
+                        result = self.output_queue.get(timeout=60)
+                    except queue.Empty:
+                        # Check whether any worker has died unexpectedly
+                        dead_procs = (
+                            [p for p in self.subprocess_procs.processes if not p.is_alive()]
+                            if self.subprocess_procs else []
+                        )
+                        if dead_procs:
+                            raise RuntimeError(
+                                f"{len(dead_procs)} worker process(es) died unexpectedly "
+                                f"(pids: {[p.pid for p in dead_procs]})"
+                            )
+                        logger.warning("Waiting for worker result (no response in 60s, retrying)...")
+                result_idx, result_dict = result
                 all_results[result_idx] = result_dict
 
             for op_name in index_mapping:
@@ -188,16 +205,12 @@ class ComputeEngine(BaseEngine):
             for _ in self.subprocess_procs.processes:
                 self.input_queue.put(None)
 
-            kill_flag = False
-            for subprocess in self.subprocess_procs.processes:
-                subprocess.join(timeout=10)
-                if subprocess.is_alive():
-                    kill_flag = True
-                    break
-            
-            if kill_flag:
-                for subprocess in self.subprocess_procs.processes:
-                    subprocess.kill()
+            for proc in self.subprocess_procs.processes:
+                proc.join(timeout=10)
+                if proc.is_alive():
+                    logger.warning(f"Process {proc.pid} did not terminate gracefully, killing it")
+                    proc.kill()
+                    proc.join()  # Must join after kill to reap zombie process
 
             self.subprocess_procs = []
             self.subprocess_pids = []
@@ -214,7 +227,10 @@ class XCCLEngine(BaseEngine):
 
         self.heartbeat_thread: Optional[threading.Thread] = None
         self.heartbeat_task_id = 0
-        self.timeout = args_dict.get("timeout", 60)
+        # Default 300 s: Intel XPU first CCL collective triggers SYCL JIT
+        # compilation which can take 30-60 s per device; 8-device setups need
+        # well over 60 s for the initial all_reduce in xccl_infer_loop.
+        self.timeout = args_dict.get("timeout", 300)
         self.last_dispatch_time = time.time()
 
         
@@ -255,7 +271,7 @@ class XCCLEngine(BaseEngine):
             logger.info(f"spawn xccl infer loop success, pids: {self.subprocess_pids}")
 
             try:
-                signal = self.output_queue.get(timeout=60)
+                signal = self.output_queue.get(timeout=self.timeout)
                 if signal != "success":
                     logger.error(f"xccl infer loop failed, signal: {signal}")
                     sys.exit(-1)
@@ -294,25 +310,25 @@ class XCCLEngine(BaseEngine):
                 
 
     def stop(self):
+        # Stop heartbeat thread first to avoid concurrent dispatch during shutdown
+        self.is_running = False
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            self.heartbeat_thread.join(timeout=5)
+            self.heartbeat_thread = None
+
         if self.subprocess_procs:
             if self.node_rank == 0:
                 self.input_queue.put(None)
 
-            kill_flag = False
-            for subprocess in self.subprocess_procs.processes:
-                subprocess.join(timeout=10)
-                if subprocess.is_alive():
-                    kill_flag = True
-                    break
-            
-            if kill_flag:
-                for subprocess in self.subprocess_procs.processes:
-                    subprocess.kill()
+            for proc in self.subprocess_procs.processes:
+                proc.join(timeout=10)
+                if proc.is_alive():
+                    logger.warning(f"Process {proc.pid} did not terminate gracefully, killing it")
+                    proc.kill()
+                    proc.join()  # Must join after kill to reap zombie process
 
             self.subprocess_procs = []
             self.subprocess_pids = []
-        
-        self.is_running = False
             
 
 class P2PEngine(BaseEngine):
