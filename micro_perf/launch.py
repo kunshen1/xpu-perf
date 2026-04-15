@@ -254,13 +254,19 @@ if __name__ == "__main__":
         engine_name = OP_ENGINE_MAPPING[op_name]
         engine_set.add(engine_name)
 
-    with XpuPerfServer(engine_args_dict, required_engines=engine_set) as server_instance:
-        info_dict = server_instance.get_info()
-        bench_results = server_instance.normal_bench(test_cases)
-        export_reports(
-            args.report_dir, 
-            info_dict, 
-            test_cases, 
-            bench_results
-        )
+    try:
+        with XpuPerfServer(engine_args_dict, required_engines=engine_set) as server_instance:
+            info_dict = server_instance.get_info()
+            bench_results = server_instance.normal_bench(test_cases)
+            export_reports(
+                args.report_dir, 
+                info_dict, 
+                test_cases, 
+                bench_results
+            )
+    except RuntimeError as e:
+        logger.error(f"Fatal error: {e}")
+        # Force-exit: Python's normal shutdown hangs when GPU runtime
+        # threads (SYCL/L0/oneCCL) are blocked on dead hardware.
+        os._exit(1)
     

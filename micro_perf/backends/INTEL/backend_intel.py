@@ -11,10 +11,10 @@ import traceback
 from datetime import timedelta
 
 import torch
-try:
-    import intel_extension_for_pytorch
-except:
-    pass
+# try:
+#     import intel_extension_for_pytorch
+# except:
+#     pass
 import torch.distributed as dist
 import time
 try:
@@ -125,13 +125,46 @@ class BackendINTEL(Backend):
         os.environ.setdefault("SYCL_CACHE_PERSISTENT", "1")
         os.environ.setdefault("ZE_ENABLE_MODULE_CACHE", "1")
 
+        # CCL_BLOCKING_WAIT=1: make the host thread block in work.wait()
+        #   until the collective truly completes on the device.  This ensures
+        #   all BCS DMA is fully drained after every CCL op, preventing the
+        #   cumulative GuC exec queue pressure that leads to GT resets.
+        #
+        #   Without this, dist.all_reduce() returns while BCS DMA is still
+        #   in flight (host non-blocking mode).  Consecutive CCL ops then
+        #   pile up BCS submissions across the entire test suite, and the
+        #   async __guc_exec_queue_destroy_async in the kernel accumulates
+        #   until the GuC times out and triggers a device-level GT reset.
+        #
+        #   For a benchmark that measures one collective at a time, host
+        #   blocking has zero performance impact — we measure device-side
+        #   latency via XPU Events, not host wall-clock time.
+        #
+        # CCL_SAME_STREAM=1: oneCCL reuses PyTorch's SYCL compute stream
+        #   instead of creating a separate internal stream.  This makes
+        #   torch.xpu.synchronize() (device_synchronize) effective for
+        #   draining CCL's BCS queue, because both PyTorch ops and CCL ops
+        #   are on the same stream.  Without this, device_synchronize()
+        #   only drains PyTorch's own queue while CCL's BCS continues
+        #   running on a separate stream — the root cause of BCS overflow
+        #   when device_synchronize() was used in warmup loops.
+        #
+        # Both use setdefault so users/scripts (e.g. run_xccl_ops.sh) can
+        # override via environment variables if needed.
+        os.environ.setdefault("CCL_BLOCKING_WAIT", "1")
+        os.environ.setdefault("CCL_SAME_STREAM", "1")
+
         return super().initialize_ccl(rank, world_size)
 
-    # DMA transfers above this size require per-iteration device_synchronize()
-    # to prevent the xe BCS (Blitter Command Streamer) command queue from
-    # overflowing.  Queuing multiple large DMA submissions without draining
-    # the BCS queue causes xe driver engine resets, which cascade to CCS
-    # resets and permanently hang any in-flight CCL collectives.
+    # DMA transfers above this size require per-iteration BCS drain to
+    # prevent the xe BCS (Blitter Command Streamer) command queue from
+    # overflowing.  The drain mechanism differs by op type:
+    #   - D2H / H2D: device_synchronize() — BCS via PyTorch's SYCL queue.
+    #   - CCL collectives: op_group_barrier() — BCS via oneCCL's internal
+    #     queue, which is invisible to device_synchronize().
+    # Queuing multiple large DMA submissions without draining causes xe
+    # driver engine resets, which cascade to CCS resets and permanently
+    # hang any in-flight CCL collectives.
     _BCS_SYNC_THRESHOLD_BYTES = 512 * 1024 * 1024   # 512 MB
     # tensor_size >= this value → reduce prefer_iterations to 1 for CCL ops.
     # At this size (input+output ≥ 1 GB, algo_size ≥ 512 MB), each allreduce
@@ -154,18 +187,23 @@ class BackendINTEL(Backend):
         return False
 
     def _needs_bcs_throttle(self, op_instance):
-        """Return True when per-iteration device_synchronize() is needed.
+        """Return True when per-iteration BCS drain is needed.
 
         BCS (Blitter Command Streamer) throttle is required for any operation
         whose tensor is large enough to risk overflowing the xe GuC exec queue
         when multiple iterations are submitted back-to-back without draining.
 
-        This covers two cases:
+        This covers two cases with DIFFERENT drain mechanisms:
           1. D2H / H2D: explicit PCIe DMA via the BCS engine.
-          2. Large CCL collectives (AllReduce, etc.) over PCIe: the ring-allreduce
-             algorithm internally issues BCS DMA transfers for the reduce-scatter
-             and all-gather phases; without inter-iteration sync these accumulate
-             and trigger the same GuC exec queue overflow.
+             Drain: device_synchronize() — effective because PyTorch owns
+             the SYCL queue that submits the DMA.
+          2. Large CCL collectives (AllReduce, etc.) over PCIe: the
+             ring-allreduce algorithm internally issues BCS DMA transfers
+             for the reduce-scatter and all-gather phases.
+             Drain: op_group_barrier() — submits a new CCL op to the same
+             process group, which forces oneCCL's FIFO to drain the
+             previous op's BCS before starting the barrier.
+             device_synchronize() is a NO-OP for oneCCL's internal queues.
         """
         return op_instance.tensor_size >= self._BCS_SYNC_THRESHOLD_BYTES
 
@@ -236,12 +274,50 @@ class BackendINTEL(Backend):
         else:
             bcs_throttle = self._needs_bcs_throttle(op_instance)
 
-            # Warmup: for large D2H/H2D, drain BCS after each iteration to
-            # avoid queuing up DMA submissions that the GuC cannot process fast
-            # enough before we reach the measurement window.
+            # --- Classify the op BEFORE warmup so both warmup and
+            # measurement loops use the correct BCS drain strategy. ---
+            #
+            # With CCL_BLOCKING_WAIT=1 + CCL_SAME_STREAM=1 (set in
+            # initialize_ccl as defaults):
+            #   - Each dist.all_reduce() blocks the host until the
+            #     collective fully completes on the device.
+            #   - device_synchronize() IS effective because CCL uses the
+            #     same SYCL stream as PyTorch.
+            #   - The op_group_barrier calls below are redundant but
+            #     harmless — they serve as a safety net in case the user
+            #     overrides CCL_SAME_STREAM=0 via environment.
+            #
+            # Without these env vars (CCL_SAME_STREAM=0):
+            #   - device_synchronize() only drains PyTorch's own SYCL
+            #     queue; oneCCL's internal BCS queue keeps running.
+            #   - op_group_barrier is the only reliable BCS drain:
+            #     oneCCL's strict FIFO ordering ensures the barrier
+            #     cannot start until the previous allreduce's BCS
+            #     transfers have fully completed.
+            #
+            # "Large CCL op" = tensor_size >= 512 MB (bcs_throttle) AND
+            # the op participates in a CCL group (group_size > 1) AND it
+            # is NOT a cross-device copy (D2H/H2D use PyTorch's own BCS
+            # queue, not oneCCL's).
+            is_large_ccl_op = (
+                bcs_throttle
+                and group_size > 1
+                and not self._op_has_cpu_tensor(op_instance)
+            )
+
+            # Warmup: drain BCS after each iteration.
+            #
+            # With CCL_BLOCKING_WAIT=1, each allreduce already blocks
+            # until completion, so the barriers are redundant.  They are
+            # kept as a safety net for CCL_SAME_STREAM=0 override.
+            #
+            # - Large CCL ops: op_group_barrier forces oneCCL FIFO drain.
+            # - D2H / H2D: device_synchronize() drains PyTorch's queue.
             for i in range(warmup_iterations):
                 op_instance.core_run(tensor_list[i % len(tensor_list)])
-                if bcs_throttle:
+                if is_large_ccl_op:
+                    self.op_group_barrier(op_group=op_group, group_size=group_size)
+                elif bcs_throttle:
                     self.device_synchronize()
             
             self.device_synchronize()
@@ -287,20 +363,7 @@ class BackendINTEL(Backend):
             start_event = torch.xpu.Event(enable_timing=True)
             end_event = torch.xpu.Event(enable_timing=True)
 
-            # For large CCL collectives, torch.xpu.synchronize() only drains
-            # PyTorch's own SYCL queues; oneCCL uses independent internal queues
-            # for BCS DMA and is NOT flushed by device_synchronize().  The only
-            # guaranteed way to drain CCL's BCS queue between iterations is to
-            # submit a new collective op to the *same* CCL process group: CCL
-            # processes ops in strict FIFO order, so the barrier cannot start
-            # until the previous (large) allreduce's BCS transfers are fully
-            # committed.  When the barrier returns, BCS is idle.
-            #
-            # "Large CCL op" = bcs_throttle (tensor_size ≥ 512 MB) AND the op
-            # participates in a CCL group (group_size > 1) AND it is NOT a
-            # cross-device copy (no CPU tensor).  D2H/H2D go through the
-            # wallclock path above, so they never reach here.
-            is_large_ccl_op = bcs_throttle and group_size > 1
+            # is_large_ccl_op is already computed before the warmup loop.
 
             self.device_synchronize()
             # Pre-measurement barrier: drains any pending BCS from warmup
@@ -397,20 +460,46 @@ class BackendINTEL(Backend):
             tensor_list = op_instance.create_tensors(max_data_cnt)
             random.shuffle(tensor_list)
 
-            latency_us, _ = self.core_perf(op_instance, 2, 2, tensor_list, profiling=False)
-            prefer_iters = min(max(int(max_test_time / latency_us), 2), min_test_iters)
-            if op_instance.group_size > 1:
-                dist_module = self.get_dist_module()
-                prefer_iters_list = [None for _ in range(op_instance.group_size)]
-                dist_module.all_gather_object(prefer_iters_list, prefer_iters, group=op_instance.op_group)
-                prefer_iters = max(prefer_iters_list)
+            is_large_tensor = op_instance.tensor_size >= self._LARGE_CCL_ITER_THRESHOLD_BYTES
+
+            if is_large_tensor:
+                # Skip probe phase entirely for very large tensors.
+                # We already know min_test_iters=1, so the probe result
+                # cannot change prefer_iters — it always computes
+                # min(max(X, 2), 1) = 1.  But the probe itself runs
+                # warmup+measurement allreduces + barriers = ~5 extra CCL
+                # ops, each of which creates/destroys a GuC exec queue.
+                # Over the full test suite this cumulative pressure causes
+                # __guc_exec_queue_destroy_async to hog the CPU and
+                # eventually trigger GT reset + drm_neo.cpp abort.
+                prefer_iters = 1
+            else:
+                latency_us, _ = self.core_perf(op_instance, 2, 2, tensor_list, profiling=False)
+                prefer_iters = min(max(int(max_test_time / latency_us), 2), min_test_iters)
+                if op_instance.group_size > 1:
+                    dist_module = self.get_dist_module()
+                    prefer_iters_list = [None for _ in range(op_instance.group_size)]
+                    dist_module.all_gather_object(prefer_iters_list, prefer_iters, group=op_instance.op_group)
+                    prefer_iters = max(prefer_iters_list)
             time.sleep(sleep_time)
 
             actual_profiling = self.enable_profiling and op_instance.require_profiling
-            latency_us, kernel_mapping = self.core_perf(op_instance, 2, prefer_iters, tensor_list, profiling=actual_profiling)
+            actual_warmup = 1 if is_large_tensor else 2
+            latency_us, kernel_mapping = self.core_perf(op_instance, actual_warmup, prefer_iters, tensor_list, profiling=actual_profiling)
 
             del tensor_list
             self.empty_cache()
+
+            # Cooldown after large ops: give the xe driver time to process
+            # pending async GuC exec queue destructions.  Large CCL ops
+            # generate heavy BCS traffic whose cleanup
+            # (__guc_exec_queue_destroy_async) runs asynchronously in the
+            # kernel.  Without a pause the next case starts while the
+            # driver is still cleaning up, compounding GuC pressure until
+            # a GT reset is triggered.
+            if bcs_throttle:
+                self.device_synchronize()
+                time.sleep(1.0)
         except Exception as e:
             traceback.print_exc()
 

@@ -544,7 +544,17 @@ class Backend(ABC):
             data = torch.ones([1], dtype=torch.float32, device=self.get_torch_device_name()) * assigned_value
             dist.all_reduce(data, op=dist.ReduceOp.SUM)
             print(data)
-            cpu_group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+            # Set a finite timeout on the gloo group so that if any rank
+            # crashes (e.g. drm_neo.cpp abort), the surviving ranks' gloo
+            # all_gather_object calls will eventually timeout and raise
+            # instead of hanging forever.  Without this, a single rank's
+            # crash causes all other ranks to block indefinitely in gloo
+            # collectives, making the entire process tree unkillable.
+            cpu_group = dist.new_group(
+                ranks=list(range(world_size)),
+                backend="gloo",
+                timeout=timedelta(seconds=120)
+            )
         else:
             self.set_device(local_device_id)
 

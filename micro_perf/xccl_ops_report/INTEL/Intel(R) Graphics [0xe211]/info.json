@@ -15,13 +15,13 @@
     },
     "backend": {
         "device_name": "Intel(R) Graphics [0xe211]",
-        "device_count": 8,
+        "device_count": 2,
         "device_memory_mb": 23256.0,
         "torch_version": "2.9.0+xpu"
     },
     "runtime": {
-        "device_mapping": "[0, 1, 2, 3, 4, 5, 6, 7]",
-        "device_ids": "[0, 1, 2, 3, 4, 5, 6, 7]",
+        "device_mapping": "[0, 1]",
+        "device_ids": "[0, 1]",
         "numa_num": 2,
         "numa_order": "[0, 1]",
         "node_world_size": 1,

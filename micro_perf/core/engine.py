@@ -114,7 +114,14 @@ class BaseEngine(ABC):
     def stop(self):
         raise NotImplementedError
 
-    def dispatch(self, test_cases): 
+    def dispatch(self, test_cases, max_wait=60):
+        """Dispatch test cases to workers and collect results.
+
+        Args:
+            test_cases: dict mapping op_name to list of case dicts.
+            max_wait: maximum seconds to wait for a single result before
+                      aborting (default 60s).
+        """
         index_mapping = {}
         with self.dispatch_lock:
             task_idx = 0
@@ -130,25 +137,37 @@ class BaseEngine(ABC):
                     index_mapping[op_name].append(case_mapping)
 
             all_results = {}
+            completed = 0
             for _ in range(task_idx):
-                result = None
-                while result is None:
-                    try:
-                        result = self.output_queue.get(timeout=60)
-                    except queue.Empty:
-                        # Check whether any worker has died unexpectedly
-                        dead_procs = (
-                            [p for p in self.subprocess_procs.processes if not p.is_alive()]
-                            if self.subprocess_procs else []
+                try:
+                    result = self.output_queue.get(timeout=max_wait)
+                except queue.Empty:
+                    # Check whether any worker has died unexpectedly
+                    dead_procs = (
+                        [p for p in self.subprocess_procs.processes if not p.is_alive()]
+                        if self.subprocess_procs else []
+                    )
+                    if dead_procs:
+                        logger.error(
+                            f"{len(dead_procs)} worker(s) died "
+                            f"(pids: {[p.pid for p in dead_procs]}). "
+                            f"Completed {completed}/{task_idx} cases."
                         )
-                        if dead_procs:
-                            raise RuntimeError(
-                                f"{len(dead_procs)} worker process(es) died unexpectedly "
-                                f"(pids: {[p.pid for p in dead_procs]})"
-                            )
-                        logger.warning("Waiting for worker result (no response in 60s, retrying)...")
+                    else:
+                        logger.error(
+                            f"Dispatch timeout: no result for {max_wait}s. "
+                            f"Completed {completed}/{task_idx} cases. "
+                            f"Workers may be hung (GPU hang / gloo deadlock)."
+                        )
+                    self.stop()
+                    raise RuntimeError(
+                        f"Dispatch aborted: no worker response within {max_wait}s. "
+                        f"Completed {completed}/{task_idx} cases."
+                    )
+
                 result_idx, result_dict = result
                 all_results[result_idx] = result_dict
+                completed += 1
 
             for op_name in index_mapping:
                 for case_mapping in index_mapping[op_name]:
@@ -208,9 +227,18 @@ class ComputeEngine(BaseEngine):
             for proc in self.subprocess_procs.processes:
                 proc.join(timeout=10)
                 if proc.is_alive():
-                    logger.warning(f"Process {proc.pid} did not terminate gracefully, killing it")
-                    proc.kill()
-                    proc.join()  # Must join after kill to reap zombie process
+                    # Escalate: SIGTERM first (allows Python cleanup handlers
+                    # to run, e.g. dist.destroy_process_group), then SIGKILL.
+                    # Processes stuck in C-level blocking calls (e.g. gloo
+                    # collectives) may not respond to SIGTERM, so we cap the
+                    # SIGTERM wait at 5 seconds before escalating to SIGKILL.
+                    logger.warning(f"Process {proc.pid} did not exit, sending SIGTERM")
+                    proc.terminate()
+                    proc.join(timeout=5)
+                    if proc.is_alive():
+                        logger.warning(f"Process {proc.pid} ignored SIGTERM, sending SIGKILL")
+                        proc.kill()
+                    proc.join()  # Reap zombie process entry from kernel
 
             self.subprocess_procs = []
             self.subprocess_pids = []
@@ -296,17 +324,25 @@ class XCCLEngine(BaseEngine):
             sys.exit(-1)
 
     def _heartbeat_monitor(self):
+        """Monitor worker health.  If all workers die, log and set
+        ``is_running = False`` so that the next dispatch timeout can
+        detect the situation promptly.
+        """
         while self.is_running:
             try:
-                elapsed = time.time() - self.last_dispatch_time
-                if elapsed > self.timeout:
-                    logger.info(f"heartbeat...")
-                    self.dispatch(self.demo_test_case)
-                    self.last_dispatch_time = time.time()
-                time.sleep(1)
+                if self.subprocess_procs:
+                    alive = [p for p in self.subprocess_procs.processes if p.is_alive()]
+                    if not alive:
+                        logger.error(
+                            "Heartbeat: all worker processes have exited. "
+                            "Marking engine as stopped."
+                        )
+                        self.is_running = False
+                        break
+                time.sleep(5)
             except Exception as e:
-                logger.error(f"heartbeat monitor failed, error: {e}")
-                time.sleep(2)
+                logger.error(f"heartbeat monitor error: {e}")
+                time.sleep(5)
                 
 
     def stop(self):
@@ -323,9 +359,18 @@ class XCCLEngine(BaseEngine):
             for proc in self.subprocess_procs.processes:
                 proc.join(timeout=10)
                 if proc.is_alive():
-                    logger.warning(f"Process {proc.pid} did not terminate gracefully, killing it")
-                    proc.kill()
-                    proc.join()  # Must join after kill to reap zombie process
+                    # Same SIGTERM → SIGKILL escalation as ComputeEngine.
+                    # XCCL workers are more likely to be stuck in gloo
+                    # all_gather_object (waiting for a crashed rank) — the
+                    # gloo group's 120 s timeout should unblock them, but
+                    # if not, SIGKILL is the last resort.
+                    logger.warning(f"Process {proc.pid} did not exit, sending SIGTERM")
+                    proc.terminate()
+                    proc.join(timeout=5)
+                    if proc.is_alive():
+                        logger.warning(f"Process {proc.pid} ignored SIGTERM, sending SIGKILL")
+                        proc.kill()
+                    proc.join()  # Reap zombie process entry from kernel
 
             self.subprocess_procs = []
             self.subprocess_pids = []
